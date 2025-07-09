@@ -1,0 +1,92 @@
+#!/bin/bash
+set -euo pipefail
+
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/sqlch"
+STATION_FILE="$CONFIG_DIR/stations"
+
+mkdir -p "$CONFIG_DIR"
+touch "$STATION_FILE"
+
+choose_play() {
+  if [ ! -s "$STATION_FILE" ]; then
+    gum style --foreground 212 "No stations saved yet."
+    sleep 2
+    return
+  fi
+
+  station=$(awk -F= '{print $1}' "$STATION_FILE" | gum choose --header="🎧 Choose a station to play")
+  if [ -n "$station" ]; then
+    sqlchctl play "$station"
+  fi
+}
+
+search_and_add() {
+  query=$(gum input --placeholder "Search genre/tag (e.g. jazz, chill, metal)")
+  if [ -z "$query" ]; then return; fi
+
+  results=$(curl -fsSL "https://de1.api.radio-browser.info/json/stations/bytag/$query" | jq -r '.[] | "\(.name)=\(.url)"' | gum choose --no-limit --header="🎯 Pick a station to add")
+  [ -z "$results" ] && return
+
+  echo "$results" >>"$STATION_FILE"
+  gum style --foreground 42 "✅ Added: $(echo "$results" | cut -d= -f1)"
+  sleep 1
+}
+
+delete_station() {
+  if [ ! -s "$STATION_FILE" ]; then
+    gum style --foreground 212 "⚠ No stations to delete."
+    sleep 2
+    return
+  fi
+
+  station=$(awk -F= '{print $1}' "$STATION_FILE" | gum choose --header="❌ Pick a station to delete")
+  if [ -n "$station" ]; then
+    grep -v "^$station=" "$STATION_FILE" >"$STATION_FILE.tmp" && mv "$STATION_FILE.tmp" "$STATION_FILE"
+    gum style --foreground 160 "🗑 Deleted: $station"
+    sleep 1
+  fi
+}
+
+edit_station() {
+  if [ ! -s "$STATION_FILE" ]; then
+    gum style --foreground 212 "No stations saved yet."
+    sleep 2
+    return
+  fi
+
+  # Let user pick station to edit
+  original=$(awk -F= '{print $1}' "$STATION_FILE" | gum choose --header="✏️ Choose a station to edit")
+  [ -z "$original" ] && return
+
+  # Get full line
+  full_line=$(grep "^$original=" "$STATION_FILE")
+  name=$(echo "$full_line" | cut -d= -f1)
+  url=$(echo "$full_line" | cut -d= -f2)
+
+  # Prompt edits
+  new_name=$(gum input --placeholder "Station name" --value "$name")
+  new_url=$(gum input --placeholder "Stream URL" --value "$url")
+
+  # Replace line
+  sed -i "/^$name=/d" "$STATION_FILE"
+  echo "$new_name=$new_url" >>"$STATION_FILE"
+
+  gum style --foreground 42 "✅ Updated: $new_name"
+  sleep 1
+}
+
+main_menu() {
+  while true; do
+    choice=$(gum choose --header "🎛 sqlchKNOB Control Panel" "▶ Play a station" "🔍 Search & Add Station" "❌ Delete Station" "✏️ Edit Station" "🚪 Exit")
+
+    case "$choice" in
+    "▶ Play a station") choose_play ;;
+    "🔍 Search & Add Station") search_and_add ;;
+    "❌ Delete Station") delete_station ;;
+    "✏️ Edit Station") edit_station ;;
+    "🚪 Exit") break ;;
+    esac
+  done
+}
+
+main_menu

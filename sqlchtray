@@ -1,0 +1,226 @@
+#!/usr/bin/env python3
+import os
+import shutil
+import subprocess
+import threading
+import time
+
+import gi
+
+gi.require_version("AppIndicator3", "0.1")
+gi.require_version("Gtk", "3.0")
+from gi.repository import AppIndicator3, GLib, Gtk
+
+# Initialize GTK early (fixes Fontconfig warning)
+Gtk.init_check(None)
+
+CONFIG_DIR = os.path.expanduser("~/.config/sqlch")
+STATION_FILE = os.path.join(CONFIG_DIR, "stations")
+CHANNEL_FILE = os.path.join(CONFIG_DIR, "channels")
+LAST_PLAYED = os.path.join(CONFIG_DIR, "last")
+
+sqlchCTL = "/home/prepko/.local/bin/sqlchctl"
+sqlchKNOB = "/home/prepko/.local/bin/sqlchknob"
+
+
+def launch_command(cmd):
+    for term in [
+        "kitty",
+        "alacritty",
+        "xfce4-terminal",
+        "gnome-terminal",
+        "konsole",
+        "xterm",
+    ]:
+        if shutil.which(term):
+            if isinstance(cmd, str):
+                full_cmd = f"{cmd}; echo; read -p 'Press enter to close...'"
+            else:
+                full_cmd = " ".join(cmd) + "; echo; read -p 'Press enter to close...'"
+            if not full_cmd.strip():
+                full_cmd = "echo No command provided; read -p 'Press enter to close...'"
+            subprocess.Popen([term, "-e", "bash", "-ic", full_cmd])
+            return
+    subprocess.Popen(["notify-send", "sqlch Error", "No terminal emulator found."])
+
+
+def add_item(menu, label, callback):
+    item = Gtk.MenuItem(label=label)
+    item.connect("activate", lambda _: callback())
+    menu.append(item)
+    item.show()
+
+
+class sqlchTray:
+    def __init__(self):
+        self.app_id = "sqlchtray"
+
+        icon_path = os.path.join(
+            os.environ.get("XDG_DATA_HOME", os.path.expanduser("~/.local/share")),
+            "icons/squelch_icons/sqrrlch_icon.png",
+        )
+        if not os.path.isfile(icon_path):
+            icon_path = "media-playback-start"  # fallback to safe GTK icon
+
+        self.indicator = AppIndicator3.Indicator.new(
+            self.app_id,
+            icon_path,
+            AppIndicator3.IndicatorCategory.APPLICATION_STATUS,
+        )
+        self.indicator.set_status(AppIndicator3.IndicatorStatus.ACTIVE)
+
+        self.menu = Gtk.Menu()
+        self.indicator.set_menu(self.menu)
+        self.last_display = ""
+
+        self.build_menu()
+        self.refresh_label()
+        threading.Thread(target=self.poll_status, daemon=True).start()
+
+    def build_menu(self):
+        if not shutil.which(sqlchCTL):
+            subprocess.Popen(["notify-send", "sqlchTray Error", "sqlchctl not found"])
+            return
+
+        add_item(self.menu, "▶ Play", lambda: subprocess.Popen([sqlchCTL, "start"]))
+        add_item(self.menu, "⏸ Pause", lambda: subprocess.Popen([sqlchCTL, "pause"]))
+        add_item(self.menu, "⛔ Stop", lambda: subprocess.Popen([sqlchCTL, "stop"]))
+
+        self.menu.append(Gtk.SeparatorMenuItem())
+        self.add_volume_controls()
+
+        header = Gtk.MenuItem(label="🎙 Stations:")
+        header.set_sensitive(False)
+        self.menu.append(header)
+        header.show()
+
+        self.populate_stations()
+        self.add_channel_menu()
+        self.menu.append(Gtk.SeparatorMenuItem())
+
+        add_item(
+            self.menu, "🎛 Open sqlchKnob", lambda: launch_command(["bash", sqlchKNOB])
+        )
+        add_item(
+            self.menu,
+            "📜 Show Logs",
+            lambda: launch_command("journalctl --user -u sqlchtray.service -n 50"),
+        )
+
+        quit_item = Gtk.MenuItem(label="❌ Quit")
+        quit_item.connect("activate", lambda _: Gtk.main_quit())
+        self.menu.append(quit_item)
+        quit_item.show()
+
+    def add_channel_menu(self):
+        if not os.path.exists(CHANNEL_FILE):
+            item = Gtk.MenuItem(label="⚠ No video channels")
+            item.set_sensitive(False)
+            self.menu.append(item)
+            item.show()
+            return
+
+        channel_submenu = Gtk.Menu()
+        with open(CHANNEL_FILE, "r") as f:
+            for line in f:
+                if "=" not in line:
+                    continue
+                name = line.strip().split("=", 1)[0]
+                item = Gtk.MenuItem(label=f"📺 {name}")
+                item.connect("activate", lambda _, name=name: self.play_channel(name))
+                channel_submenu.append(item)
+                item.show()
+
+        menu_item = Gtk.MenuItem(label="📺 Channels ▶")
+        menu_item.set_submenu(channel_submenu)
+        self.menu.append(menu_item)
+        menu_item.show()
+
+    def play_channel(self, name):
+        subprocess.Popen([sqlchCTL, "play-channel", name])
+
+    def add_volume_controls(self):
+        volume = Gtk.MenuItem(label="🔊 Volume")
+        submenu = Gtk.Menu()
+        for label, pct in [
+            ("Mute", 0),
+            ("25%", 25),
+            ("50%", 50),
+            ("75%", 75),
+            ("100%", 100),
+        ]:
+            item = Gtk.MenuItem(label=label)
+            item.connect("activate", lambda _, p=pct: self.set_volume(p))
+            submenu.append(item)
+            item.show()
+        volume.set_submenu(submenu)
+        self.menu.append(volume)
+        volume.show()
+
+    def set_volume(self, percent):
+        try:
+            subprocess.Popen(
+                ["pactl", "set-sink-volume", "@DEFAULT_SINK@", f"{percent}%"]
+            )
+        except Exception as e:
+            subprocess.Popen(["notify-send", "sqlch", f"Volume error: {e}"])
+
+    def populate_stations(self):
+        station_submenu = Gtk.Menu()
+        if not os.path.exists(STATION_FILE):
+            item = Gtk.MenuItem(label="⚠ No stations")
+            item.set_sensitive(False)
+            station_submenu.append(item)
+            item.show()
+        else:
+            with open(STATION_FILE, "r") as f:
+                for line in f:
+                    if "=" not in line:
+                        continue
+                    name = line.split("=")[0].strip()
+                    item = Gtk.MenuItem(label=f"🎧 {name}")
+                    item.connect("activate", self.make_station_callback(name))
+                    station_submenu.append(item)
+                    item.show()
+        station_menu_item = Gtk.MenuItem(label="🎧 Stations ▶")
+        station_menu_item.set_submenu(station_submenu)
+        self.menu.append(station_menu_item)
+        station_menu_item.show()
+
+    def make_station_callback(self, name):
+        return lambda _: self.play_station(name)
+
+    def play_station(self, name):
+        subprocess.Popen([sqlchCTL, "play", name])
+
+    def poll_status(self):
+        while True:
+            GLib.idle_add(self.refresh_label)
+            time.sleep(10)
+
+    def refresh_label(self):
+        try:
+            output = (
+                subprocess.check_output([sqlchCTL, "status"], stderr=subprocess.DEVNULL)
+                .decode()
+                .strip()
+            )
+        except:
+            output = "sqlch: Not Playing"
+        if output != self.last_display:
+            self.indicator.set_label(output, self.app_id)
+            if "Now playing" in output or output != "sqlch: Not Playing":
+                subprocess.Popen(["notify-send", "🎶 sqlch", output])
+            self.last_display = output
+
+
+def start_gui():
+    try:
+        sqlchTray()
+    except Exception as e:
+        subprocess.Popen(["notify-send", "sqlchTray Error", str(e)])
+
+
+if __name__ == "__main__":
+    start_gui()
+    Gtk.main()
